@@ -20,12 +20,26 @@ cdc_loader/
 │   ├── log_ingest.py   # 阶段二：日志流式暂存、去重冲突、按提交顺序应用
 │   ├── reference.py    # 独立参考实现（不 import 其它装载器模块）
 │   └── cli.py          # import-snapshot / consume / dump / status / verify
+├── entity/
+│   ├── protocol.py     # 对照资料行格式（7 字段）与修订身份/内容规则
+│   ├── errors.py       # 归并层错误类型与退出码
+│   ├── store.py        # 关系台账 SQLite（独立于装载器状态库）
+│   ├── fault.py        # 故障注入点 after_ledger_before_decision
+│   ├── engine.py       # 决策引擎：连通分量/冲突路径/实体标识/变动分类
+│   ├── ledger.py       # 批次摄入、设备在场刷新、版本落库、查询
+│   ├── recompute.py    # 独立全量重算器（不 import 本包其它模块）
+│   └── cli.py          # ingest / refresh / status / explain / history /
+│                       # show-version / changes / verify
 ├── examples/
-│   ├── generate_sample.py  # 确定性样例生成器（含期望结果 expected.json）
-│   └── demo.py             # 端到端演示（25 项断言，含真实崩溃子进程）
+│   ├── generate_sample.py        # 装载器样例生成器（含 expected.json）
+│   ├── demo.py                   # 装载器端到端演示（25 项断言）
+│   ├── generate_entity_sample.py # 归并层确定性样例（批次 + 场景期望）
+│   └── demo_entity.py            # 归并层端到端演示（19 项断言，含真实崩溃）
 ├── tests/
-│   └── test_loader.py      # 21 个 unittest 单元测试
-├── run_cli.py              # 隔离模式(-I)启动器
+│   ├── test_loader.py            # 装载器单元测试
+│   └── test_entity.py            # 归并层单元测试
+├── run_cli.py                    # 装载器隔离模式(-I)启动器
+├── run_entity.py                 # 归并层隔离模式(-I)启动器
 └── README.md
 ```
 
@@ -244,3 +258,165 @@ python3 -m unittest discover -s tests -v          # 21 个单元测试
 升序、事务内按 `seq` 升序回放 `commit_lsn > S` 的已提交事务 → 输出最终
 行集、检查点、已应用/中止/悬空事务清单。`verify` 子命令逐行比对装载器
 的 `device_master` 与参考结果，并核对检查点是否一致。
+
+---
+
+## 8. 设备实体归并层（entity/）
+
+采购、维修、供应商各自使用不同的设备编号。归并层在 `device_master`
+之上建立可追溯的实体归并：**直接只读**装载器状态库的设备主表，另建
+**独立的 SQLite 关系台账**，不修改原装载入口的任何行为。设备不会因为
+“型号相同”被自动认作一台——归并依据完全由外部对照资料显式提供。
+
+### 8.1 对照资料格式（严格）
+
+一次投递为一个 JSONL 批次文件（可多个文件合成一批），每行**恰好** 7 个字段：
+
+| 字段          | 约束                                                         |
+|---------------|--------------------------------------------------------------|
+| `source`      | 非空字符串，资料来源（如 procurement / maintenance / supplier）|
+| `relation_id` | 非空字符串，来源内部的关系编号                                |
+| `revision`    | 整数 ≥ 1（拒绝布尔），同一 `(source, relation_id)` 的修订号   |
+| `endpoint_a`  | 非空字符串，一端设备编号                                      |
+| `endpoint_b`  | 非空字符串，另一端设备编号，不得与 `endpoint_a` 相同          |
+| `category`    | `same_entity`（同一实体）或 `must_differ`（必须不同）         |
+| `effective`   | 布尔；`false` 表示自该修订起撤销此关系                        |
+
+缺字段、多字段、类型不符一律按协议错误拒绝（退出码 2）。
+
+### 8.2 资料修订规则
+
+* **身份与内容**：修订身份为 `(source, relation_id, revision)`；内容为
+  `(endpoint_a, endpoint_b, category, effective)`。台账按身份**持久保留
+  每一条修订的完整内容**，永不改写、永不删除。
+* **连续递增**：每个 `(source, relation_id)` 的修订号从 1 开始、每次 +1。
+  新修订必须恰好接续台账当前最大号，跳号拒绝。
+* **取代**：更高修订号可以撤销（`effective=false`）、更换端点或改变类别；
+  关系的当前状态 = 最大修订号的内容。
+* **重传与篡改**：修订号 ≤ 当前最大号的行是旧版本重投——内容与台账完全
+  一致则幂等无效果；**任何内容字段被改写即整批拒绝**（`RevisionConflict`，
+  退出码 3）。批内每一行都与台账逐字比对，不只看各关系的最新版本，
+  已被取代的旧修订被改写同样拒绝。
+* **批内重复**：同一身份在批内出现两次，内容一致去重，不一致即拒绝。
+
+### 8.3 决策计算与实体身份规则
+
+* **顶点**：当前在场的全部设备（`refresh` 时从 `device_master` 同步）。
+* **边**：当前生效且两端都在场的 `same_entity` 关系。任一端不在场的
+  关系**暂扣**（数据保留、不参与计算），设备重现后自动重新参与。
+* **实体**：`same_entity` 边的无向连通分量；连通可传递（A-B、B-C ⇒
+  A 与 C 同属一个实体）。无关系的设备自成单设备实体。
+* **约束**：生效且两端在场的 `must_differ` 作用于**整个分量**：两端落在
+  同一分量即冲突（包括经链式传递后的跨端冲突）。
+* **实体标识（确定且公开）**：`E-` + 分量内字典序最小的设备编号。
+  成员集合不变则标识不变；不同分量的最小编号必然不同，标识不会碰撞。
+* **分组哈希（公开）**：`sha256(canonical_json([[entity_id, 成员...], ...]))`，
+  按 entity_id 升序、成员字典序；`canonical_json` 即
+  `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)`。
+* **冲突路径（确定且可复核）**：从约束两端中字典序较小端出发做广度优先
+  搜索；每层邻居按设备编号字典序展开；同一对设备间的多条平行关系按
+  `(source, relation_id, revision)` 字典序取第一条。错误报告列出每条冲突
+  约束及其完整关系路径，不只报“不一致”。
+* **版本**：决策分组与当前版本不同才落新版本（`refresh` 与 `ingest`
+  共用同一套判定）；分组不变不出版本，因此重读相同资料不会凭空增加
+  历史版本。仅约束变化（不改变分组）也不产生新版本。
+
+### 8.4 批次原子性与故障注入
+
+一次投递是**不可分割的决策批次**：修订对照与写入 → 批次登记 → 最终候选
+图统一判定 → 版本落库 → 进度推进，全部在**同一条 SQLite 事务**内完成。
+同一批中“撤销旧连接 + 加入新连接”按最终候选图统一判定（不按事件先后
+顺序），拆分与合并在同一版本内完成。任何矛盾（格式 / 篡改 / 约束冲突）
+或崩溃都使整批回滚：修订台账、实体成员、批次与处理进度维持投递前状态。
+
+故障注入点（`--fault after_ledger_before_decision`，`os._exit(42)`）位于
+**关系台账已写入（事务内）、决策尚未落定**的位置。崩溃使未提交事务整体
+回滚，重开后成员、修订台账与历史版本均无半批状态，用同一批次文件重投
+即可。
+
+### 8.5 刷新：上游删除与重现
+
+`refresh` 重新读取 `device_master` 并同步在场设备：上游删除的设备退出
+活动成员（其关联关系暂扣，数据保留）；设备重新出现后自动重新参与约束
+判定。若重现使既有约束重新生效并产生矛盾，本次刷新整体拒绝、不落版本，
+需先修正资料再刷新。
+
+### 8.6 运行方式
+
+```bash
+cd /workspace/cdc_loader
+
+# (0) 准备样例：装载器样例 + 归并层样例
+python3 -I examples/generate_sample.py /tmp/cdc_sample
+python3 -I examples/generate_entity_sample.py /tmp/entity_sample
+DB=/tmp/cdc/state.db; LEDGER=/tmp/cdc/ledger.db
+
+# (1) 装载器正常跑（行为不变）
+python3 -I run_cli.py import-snapshot --db "$DB" \
+    --manifest /tmp/cdc_sample/manifest.json \
+    --shards /tmp/cdc_sample/shard_0.jsonl /tmp/cdc_sample/shard_1.jsonl /tmp/cdc_sample/shard_2.jsonl
+python3 -I run_cli.py consume --db "$DB" \
+    --logs /tmp/cdc_sample/log_1.jsonl /tmp/cdc_sample/log_2.jsonl
+
+# (2) 同步在场设备（首次必须，建立版本 1）
+python3 -I run_entity.py refresh --ledger-db "$LEDGER" --loader-db "$DB"
+
+# (3) 摄入对照资料批次（原子决策批次）
+python3 -I run_entity.py ingest --ledger-db "$LEDGER" \
+    --batch /tmp/entity_sample/b1_init.jsonl
+
+# (4) 查询：状态 / 按设备解释 / 历史 / 某版本分组 / 相邻版本变动
+python3 -I run_entity.py status   --ledger-db "$LEDGER"
+python3 -I run_entity.py explain  --ledger-db "$LEDGER" --device D001 [--version N]
+python3 -I run_entity.py history  --ledger-db "$LEDGER"
+python3 -I run_entity.py show-version --ledger-db "$LEDGER" --version 3
+python3 -I run_entity.py changes  --ledger-db "$LEDGER" --version 4
+
+# (5) 独立全量重算器：逐版本对照完整分组与冲突结论
+python3 -I run_entity.py verify   --ledger-db "$LEDGER"
+```
+
+`explain` 输出设备所在实体、成员、依据关系（边）、从该设备到各成员的
+确定性路径、作用于该实体的“必须不同”约束，以及因端点缺席而暂扣的
+关系。成员取自版本快照；依据按该版本的台账水位重算（当前版本用台账
+头部水位——后续未产生新版本的批次可能改变了依据，如撤销冗余关系）。
+`changes --version N` 给出 N-1 → N 的合并 / 拆分 / 出现 / 消失 /
+成员增减（含设备级出现与消失），全部按确定顺序输出。
+
+### 8.7 独立全量重算器
+
+`entity/recompute.py` 不 import 归并层的任何其它模块，只按本 README
+公开的规则独立实现，对台账中**每一个被接受的版本**：以该版本的台账
+水位重放修订 → 以该版本记录的活跃设备为顶点重算连通分量与实体标识 →
+比对**完整分组**（实体标识 + 全部成员集合，而非实体数量）与分组哈希 →
+重算“必须不同”约束结论（被接受版本必须零冲突）。另做头部检查：以台账
+当前水位 + 当前在场设备重算，结果必须与当前版本一致（证明没有漏建
+版本）。任何不一致逐条列出并以退出码 6 结束。
+
+### 8.8 失败后如何重投
+
+| 失败情形                       | 现象/退出码                  | 处置                                                         |
+|--------------------------------|------------------------------|--------------------------------------------------------------|
+| 资料格式/修订号不连续          | `RelationProtocolError`，2   | 修正批次文件后整批重投；台账无残留                           |
+| 旧修订内容被改写（含已被取代） | `RevisionConflict`，3        | 数据正确性红线，人工与来源方核对；归并层拒绝并保持现状       |
+| 约束与连通关系矛盾             | `ConstraintConflict`，5      | 按报告中的冲突约束与关系路径修正资料后整批重投；台账无残留   |
+| 未 refresh / 快照未发布        | `UpstreamNotReady`，4        | 先让装载器发布快照，再运行 `refresh`                         |
+| 决策落定前崩溃（故障注入）     | 退出码 42                    | 重开台账用**同一批次文件**重投；无半批状态                   |
+| 普通进程退出                   | —                            | 全部状态在 SQLite，重开同一 `--ledger-db` 继续即可           |
+
+幂等性保证：批次重投（内容一致）只命中去重，不产生重复修订、不产生
+新版本；任何不确定时运行 `verify` 用独立重算器全量对照。
+
+### 8.9 归并层演示与测试
+
+```bash
+python3 -I examples/demo_entity.py                # 19 项端到端断言（含真实崩溃）
+python3 -m unittest discover -s tests -v          # 装载器 + 归并层全部单元测试
+```
+
+演示覆盖：两条独立连接构成链后触发跨端冲突（报告 D010→D011→D012 关系
+路径）；同一批撤销桥边并新增另一连接产生拆分与合并（只出一个新版本）；
+已被新修订取代的旧修订被篡改（拒绝且整批回滚）；上游删除并重新出现
+设备（暂扣与重新参与）；两个来源对同一对端点提供依据后撤销其中一条
+（另一条仍然有效，分组不变不出版本）；`after_ledger_before_decision`
+崩溃后重投；全部批次重投幂等；独立重算器逐版本对照。
