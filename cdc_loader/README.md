@@ -42,21 +42,41 @@ cdc_loader/
 │   ├── reconcile.py    # 独立离线核算器（不 import 本包其它模块）
 │   └── cli.py          # ingest / build / runs / cells / drill /
 │                       # unassigned / audit / status / verify
+├── coverage/
+│   ├── protocol.py     # 契约/豁免行格式（13/5 字段）、不可变稿号规则
+│   ├── errors.py       # 覆盖层错误类型与退出码（含 AuditStale=8）
+│   ├── timeutil.py     # IANA 时区、左闭右开、DST gap/fold、步长锚定
+│   ├── store.py        # 契约/豁免/审计明细 SQLite（第四个独立库）
+│   ├── ingest.py       # 契约稿与豁免批次摄入、同稿篡改整批拒收
+│   ├── snapshot.py     # 按批次固定契约/豁免/读数选版/成员版本快照
+│   ├── scheduler.py    # 日程展开：交集、豁免并集扣除、DST 处理
+│   ├── matcher.py      # 容差配对：最近优先/同距取早/别名归并/重复诊断
+│   ├── gaps.py         # 连续缺采缺口段（豁免切断）与附近读数诊断
+│   ├── fault.py        # 故障注入点 after_detail_before_confirm
+│   ├── audit.py        # 口径冻结/两阶段原子发布/同步门/残档重做
+│   ├── query.py        # runs/report/missing/duplicates/unmatched/explain
+│   ├── verifier.py     # 独立核对（不 import scheduler/matcher/gaps/audit）
+│   └── cli.py          # ingest-contracts / ingest-exemptions / audit /
+│                       # report / missing / duplicates / unmatched /
+│                       # explain / runs / status / verify
 ├── examples/
 │   ├── generate_sample.py        # 装载器样例生成器（含 expected.json）
 │   ├── demo.py                   # 装载器端到端演示（25 项断言）
 │   ├── generate_entity_sample.py # 归并层确定性样例（批次 + 场景期望）
 │   ├── demo_entity.py            # 归并层端到端演示（19 项断言，含真实崩溃）
 │   ├── generate_reading_sample.py# 读数层确定性样例（上游/归并/读数批次）
-│   └── demo_reading.py           # 读数层端到端演示（32 项断言，含真实崩溃）
+│   ├── demo_reading.py           # 读数层端到端演示（32 项断言，含真实崩溃）
+│   ├── generate_coverage_sample.py # 覆盖审计样例（契约/豁免/DST/边界）
+│   └── demo_coverage.py          # 覆盖审计端到端演示（48 项断言，含真实崩溃）
 ├── tests/
 │   ├── test_loader.py            # 装载器单元测试
 │   ├── test_entity.py            # 归并层单元测试
-│   └── test_reading.py           # 读数事实仓与投影单元测试
+│   ├── test_reading.py           # 读数事实仓与投影单元测试
+│   └── test_coverage.py          # 覆盖审计单元测试（22 个）
 ├── run_cli.py                    # 装载器隔离模式(-I)启动器
 ├── run_entity.py                 # 归并层隔离模式(-I)启动器
 ├── run_reading.py                # 读数层隔离模式(-I)启动器
-└── README.md
+└── run_coverage.py               # 覆盖审计隔离模式(-I)启动器
 ```
 
 ---
@@ -614,3 +634,189 @@ python3 -m unittest discover -s tests -v          # 装载器 + 归并层 + 读�
 新版、重传幂等；用进程间同步门在构建期间再收新稿件以证明截止范围一致；
 明细已写未启用阶段直接结束进程后旧日报可读、新口径安全重建；最后由独立
 离线核算器对所有格子、全部下钻明细与待归属记录做全量对照。
+
+---
+
+## 10. 采样覆盖审计（coverage/）
+
+工厂要区分“设备没有按计划上报”和“当天本来就不要求采样”。本层在既有
+读数事实仓与归并层成员台账之上，只做**数据质量计算与命令行入口**（不做
+可视化界面），把外部声明的采样契约展开为应到采样时刻，再与固定批次内的
+读数配对，产出覆盖/缺采/重复/未匹配明细。它**不把读数层的指标合计当成
+覆盖率**：覆盖率永远是“被覆盖的应到项 / 非豁免应到项”。本层是第四个
+独立 SQLite 库，对读数仓与归并层台账只读打开，不改写任何既有入口。
+
+### 10.1 采样契约与豁免资料格式（严格）
+
+契约批次（UTF-8 JSONL）每行**恰好** 13 个字段：
+
+| 字段                | 约束 |
+|---------------------|------|
+| `contract_no`       | 非空字符串，契约编号 |
+| `draft_no`          | 正整数（≥1，拒绝布尔），稿号 |
+| `active`            | 布尔；`false` 表示自该稿起停用 |
+| `origin`            | 非空字符串，读数来源（与读数台账 origin 对齐） |
+| `entity_id`         | 非空字符串，设备实体（与归并层实体标识对齐） |
+| `metric`            | 非空字符串，指标名 |
+| `effective_start` / `effective_end` | 带时区 ISO-8601，生效起止，左闭右开，终点更晚 |
+| `timezone`          | IANA 时区名（如 `America/New_York`），裸偏移拒收 |
+| `weekdays`          | 非空整数数组 1..7（周一=1），按日段**当地起点日期**判定 |
+| `segments`          | 非空数组，每项 `{"start":"HH:MM","end":"HH:MM"}`；`end<=start` 表示跨午夜，自动拆成两个明确日段 |
+| `step_seconds`      | 正整数，步长秒数，**以该日段起点为锚** |
+| `tolerance_seconds` | 非负整数，配对容差秒数，超容差不能补洞 |
+
+豁免批次每行**恰好** 5 个字段：`exemption_id`、`contract_no`、`start`、
+`end`（均带时区、左闭右开）、`reason`。豁免区间允许相交和包含，按
+**并集**扣除，重叠位置只扣一次但保留全部命中豁免编号。
+
+**不可变稿件**：契约身份是 `(contract_no, draft_no)`，豁免身份是
+`exemption_id`，事实表只追加、永不改写。同稿号重投且内容逐字一致 ->
+幂等无操作（仍登记一个确认批次）；同稿号换任何内容字段 ->
+`DraftConflict`（退出码 3）整批拒收，批次水位不前进。新稿号可以修订
+日程或停用（`active=false`），审计按截止批次内每个契约的**最大稿号**
+解释，契约数据因此能说明“何时生效、哪一稿在生效”。
+
+### 10.2 时间语义（IANA 时区、左闭右开、夏令时）
+
+* 所有生效、查询、豁免区间一律左闭右开 `[start, end)`；恰好落在生效
+  终点、豁免终点、查询终点的时刻都不成为应到项。
+* 日程逐日在契约 IANA 时区内展开：先与生效范围、查询范围取交集，再
+  删除豁免并集覆盖的时刻。步长以**日段起点为锚**计步（`step_index`
+  从 0 起），绝不从查询起点重新计步；跨午夜班次拆成两个日段后各自锚定。
+* 春季跳时（gap）：不存在的当地挂钟时刻不制造应到项（如纽约
+  2026-03-08 的 02:00 被跳过，段内只剩 00/01/03/04）。
+* 秋季回拨（fold）：同一当地时刻出现两次时，两个真实时刻都产生应到项，
+  分别用 `fold_occurrence=0/1` 与各自 UTC 偏移（如 `-05:00`/`-04:00`）
+  记录。每个应到项都保存时区名、当地日期/挂钟时间与 UTC 偏移，可解释
+  应到项从何而来。
+
+### 10.3 一次审计固定的四个口径坐标
+
+`audit` 固定：查询时段、契约截止批次、读数截止批次、设备成员版本
+（豁免截止批次随审计一并登记，缺省取当前最大豁免批次）。
+
+1. 契约只取 `ingest_batch_id <= 截止` 的最大稿号；停用稿不展开。
+2. 读数从读数仓固定范围选各观测的**最高稿**，撤回稿不参与。
+3. 按 `(origin, entity_id, metric)` 归到契约实体；设备 -> 实体只查
+   归并层**指定成员版本**快照，同实体的多个设备编号（别名）都能满足
+   同一计划，绝不套用今天的成员改写历史归属。
+4. 口径在阶段一就登记为 `building` 并提交；同步门等待期间即使有新批次
+   到达，后续查询全部带批次上界，固定资料批次不会漂移。
+
+### 10.4 配对规则、重复处理与覆盖率口径
+
+* 每条读数在容差内（`|Δ| <= tolerance_seconds`，含边界）选时间距离
+  **最近**的应到项；距离相同选**更早**的应到项；超容差不补洞，进
+  未匹配清单并保留最近候选与距离依据。每条读数最多匹配一个应到项。
+* 同一应到项可被多条读数命中：**只算一次覆盖**，但全部命中记录与重复
+  上报诊断（`duplicate_hit=1`）都保留。被豁免位置不接受覆盖。
+* 覆盖率只返回**分子（已覆盖非豁免应到项数）与分母（非豁免应到项数）**，
+  绝不拿实际条数除以预期条数掩盖空洞；分母为零时 `ratio=null` 并附
+  `zero_expected_note`，不除零、不称为全量正常。
+* 连续缺采在同一契约内合为缺口段；被豁免的计划位置把缺口切断。每个缺口
+  记录切断它的豁免编号，以及附近未匹配读数及其未匹配原因，可追查每个
+  缺口对应哪份日程、哪些豁免、附近读数为何没补上。
+
+### 10.5 原子发布、崩溃恢复与旧审计固定
+
+明细（`audit_expected` / `audit_matches` / `audit_gaps` /
+`audit_unmatched`）与发布位在**同一条 SQLite 事务**内写就，最后才把
+`audit_runs` 从 `building` 翻成 `published`。故障注入点
+`after_detail_before_confirm` 以 `os._exit(42)` 在明细已写、对外确认前
+真实终止进程：事务整体回滚，只留下阶段一已提交的 `building` 残档；残档
+对外读取直接报 `AuditStale`（退出码 8），不返回半份结果，用同一口径
+重做即安全清理并发布。旧 `published` 审计永不改写——契约或读数事后更正
+只影响新审计。
+
+### 10.6 SQLite 表（第四个独立库，WAL + synchronous=FULL）
+
+| 表 | 用途 |
+|----|------|
+| `contract_batches` / `exemption_batches` | 契约/豁免确认批次（截止水位锚点） |
+| `contract_drafts` | 不可变契约稿件（含时区、星期、日段、步长、容差） |
+| `exemptions` | 不可变停机豁免区间 |
+| `audit_runs` | 审计口径登记：building/published、五项计数、四份输入哈希 |
+| `audit_expected` | 应到采样时刻（时区名/当地时间/UTC 偏移/fold/豁免依据） |
+| `audit_matches` | 全部读数-应到项配对依据（含重复命中诊断） |
+| `audit_gaps` | 连续缺采缺口段、切断豁免、附近未匹配读数 |
+| `audit_unmatched` | 未匹配读数及原因与候选距离依据 |
+
+### 10.7 运行方式
+
+```bash
+cd /workspace/cdc_loader
+
+# (0) 准备样例（最小上游快照 + 归并批次 + 读数批次 + 契约/豁免批次）
+python3 -I examples/generate_coverage_sample.py /tmp/cov_sample
+
+# (1) 上游快照 + 归并层版本1/版本2 + 两个读数批次（同既有各层入口）
+python3 -I run_cli.py import-snapshot --db /tmp/cov/loader.db \
+    --manifest /tmp/cov_sample/loader/manifest.json \
+    --shards /tmp/cov_sample/loader/shard_0.jsonl
+python3 -I run_entity.py refresh --ledger-db /tmp/cov/ledger.db --loader-db /tmp/cov/loader.db
+python3 -I run_entity.py ingest  --ledger-db /tmp/cov/ledger.db --batch /tmp/cov_sample/entity/g1_merge.jsonl
+python3 -I run_reading.py ingest --reading-db /tmp/cov/reading.db \
+    --batch /tmp/cov_sample/reading/b1_base.jsonl /tmp/cov_sample/reading/b2_correct.jsonl
+
+CVDB=/tmp/cov/coverage.db; RDB=/tmp/cov/reading.db; LDB=/tmp/cov/ledger.db
+
+# (2) 登记契约稿件（每个文件一个确认批次）与停机豁免
+for f in c1_draft1 c2_spring c3_fall c4_night c5_outside c6_effedge; do
+  python3 -I run_coverage.py ingest-contracts --coverage-db "$CVDB" \
+      --batch /tmp/cov_sample/coverage/$f.jsonl
+done
+python3 -I run_coverage.py ingest-exemptions --coverage-db "$CVDB" \
+    --batch /tmp/cov_sample/coverage/e1_overlap.jsonl
+
+# (3) 固定四坐标执行审计并原子发布
+python3 -I run_coverage.py audit --coverage-db "$CVDB" \
+    --reading-db "$RDB" --ledger-db "$LDB" \
+    --query-start 2026-03-01T00:00:00Z --query-end 2026-12-31T00:00:00Z \
+    --contract-cutoff 6 --reading-cutoff 1 --membership-version 2
+
+# (4) 五类明细与溯源
+python3 -I run_coverage.py report     --coverage-db "$CVDB" --run-id 1
+python3 -I run_coverage.py missing    --coverage-db "$CVDB" --run-id 1
+python3 -I run_coverage.py duplicates --coverage-db "$CVDB" --run-id 1
+python3 -I run_coverage.py unmatched  --coverage-db "$CVDB" --run-id 1
+python3 -I run_coverage.py explain    --coverage-db "$CVDB" --run-id 1 --item-id 12
+python3 -I run_coverage.py runs       --coverage-db "$CVDB"
+
+# (5) 独立核对程序：不调用正式展开/配对函数，全量逐条对照
+python3 -I run_coverage.py verify --coverage-db "$CVDB" \
+    --reading-db "$RDB" --ledger-db "$LDB"
+```
+
+### 10.8 独立核对程序如何对照
+
+`coverage/verifier.py` 不 import `scheduler` / `matcher` / `gaps` /
+`audit`，只用标准库与本包协议/存储基础，独立重写日程展开（逐日逐段、
+段起点锚定、逐个真实时刻做生效/查询/豁免判定）与读数配对（对每个
+读数×应到项做完整 O(n·m) 比较，独立复算容差、最近选择、同距取早、
+重复命中、缺口分段），再与已发布审计的每张明细表**逐条**比对应到项、
+配对集合与距离、未匹配原因、缺口段和七项计数；任何不一致逐条列出并以
+退出码 6 结束。`building` 残档不参与对照，单独在 `stale_run_ids` 列出。
+
+### 10.9 失败后如何重做
+
+| 失败情形 | 现象/退出码 | 处置 |
+|----------|-------------|------|
+| 契约/豁免字段或时间/时区非法 | `CoverageProtocolError`，2 | 修正批次后整批重投；库内无残留 |
+| 同稿号内容被改写 | `DraftConflict`，3 | 数据红线，人工核对；新日程请用新稿号 |
+| 截止批次/成员版本不存在 | `CaliberNotFound`，7 | 先确认契约/读数批次与归并层版本再审计 |
+| 明细已写未确认时崩溃 | 退出码 42 | 残档拒读（`AuditStale`，8）；同口径重做安全发布 |
+| 普通进程退出 | — | 全部状态在 SQLite，重开同一 `--coverage-db` 继续 |
+
+### 10.10 覆盖审计演示与测试
+
+```bash
+python3 -I examples/demo_coverage.py               # 48 项端到端断言（含真实崩溃与同步门）
+python3 -m unittest discover -s tests -v           # 全部四层共 84 个单元测试
+```
+
+演示覆盖：普通班次中条数足够但集中同一时刻仍有缺采；设备别名归并后
+共同满足计划；读数改时间/撤回导致覆盖变化（旧审计固定不变）；重叠豁免
+只扣一次且切断缺口；真实 IANA 时区的春季跳时与秋季回拨；恰好落在生效
+终点、豁免终点与容差边界的记录；跨午夜拆段与零应到不除零；同步门证明
+固定批次不漂移；明细已写、确认前真实退出后不出现半份结果；最后由独立
+核对程序对每个应到时刻与读数配对做完整比较。
