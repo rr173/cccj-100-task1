@@ -30,16 +30,32 @@ cdc_loader/
 │   ├── recompute.py    # 独立全量重算器（不 import 本包其它模块）
 │   └── cli.py          # ingest / refresh / status / explain / history /
 │                       # show-version / changes / verify
+├── reading/
+│   ├── protocol.py     # 读数行格式（8 字段）/有限十进制/带时区时间归 UTC
+│   ├── errors.py       # 读数仓错误类型与退出码
+│   ├── store.py        # 读数事实仓 + 按日指标投影 SQLite（第三个独立库）
+│   ├── ingest.py       # 逐稿件不可变落仓、同稿篡改拒收、批次原子性
+│   ├── grouping.py     # 只读复用归并层已保存的分组成员（不重算连通分量）
+│   ├── fault.py        # 故障注入点 after_detail_before_publish
+│   ├── build.py        # 口径冻结选版/归属/Decimal 聚合/原子发布/同步门
+│   ├── query.py        # 格子查询、下钻、待归属清单、稿件审计
+│   ├── reconcile.py    # 独立离线核算器（不 import 本包其它模块）
+│   └── cli.py          # ingest / build / runs / cells / drill /
+│                       # unassigned / audit / status / verify
 ├── examples/
 │   ├── generate_sample.py        # 装载器样例生成器（含 expected.json）
 │   ├── demo.py                   # 装载器端到端演示（25 项断言）
 │   ├── generate_entity_sample.py # 归并层确定性样例（批次 + 场景期望）
-│   └── demo_entity.py            # 归并层端到端演示（19 项断言，含真实崩溃）
+│   ├── demo_entity.py            # 归并层端到端演示（19 项断言，含真实崩溃）
+│   ├── generate_reading_sample.py# 读数层确定性样例（上游/归并/读数批次）
+│   └── demo_reading.py           # 读数层端到端演示（32 项断言，含真实崩溃）
 ├── tests/
 │   ├── test_loader.py            # 装载器单元测试
-│   └── test_entity.py            # 归并层单元测试
+│   ├── test_entity.py            # 归并层单元测试
+│   └── test_reading.py           # 读数事实仓与投影单元测试
 ├── run_cli.py                    # 装载器隔离模式(-I)启动器
 ├── run_entity.py                 # 归并层隔离模式(-I)启动器
+├── run_reading.py                # 读数层隔离模式(-I)启动器
 └── README.md
 ```
 
@@ -420,3 +436,181 @@ python3 -m unittest discover -s tests -v          # 装载器 + 归并层全部�
 设备（暂扣与重新参与）；两个来源对同一对端点提供依据后撤销其中一条
 （另一条仍然有效，分组不变不出版本）；`after_ledger_before_decision`
 崩溃后重投；全部批次重投幂等；独立重算器逐版本对照。
+
+---
+
+## 9. 振动读数事实仓与按日指标投影（reading/）
+
+同一台机器的振动读数会散落在不同设备编号下，而维修人员会持续纠正哪些
+编号属于同一实体。本层在归并层**已经保存的分组成员**之上，建立不可变的
+逐稿件读数事实仓，以及按**固定口径**冻结的按日指标投影，让分析人员可以
+切换设备归属口径、复查旧日报“为什么是当时那个数字”。它**只读**归并层
+台账（`version_entities` / `version_devices`），不重算连通分量、不改写
+归并层，也不改变装载器与归并层的任何既有入口。本次不含网页，只提供
+命令行可运行入口。
+
+### 9.1 读数逐行资料格式（严格）
+
+一次投递为一个 JSONL 批次文件（可多个文件合成一批），每行**恰好** 8 个
+字段：
+
+| 字段          | 约束                                                          |
+|---------------|---------------------------------------------------------------|
+| `origin`      | 非空字符串，读数来源；不同来源的 `reading_key` 互相独立计数   |
+| `reading_key` | 非空字符串，来源内部的观测编号                                |
+| `edition`     | 正整数（≥1，拒绝布尔），同一观测的稿件号                      |
+| `device`      | 非空字符串，稿件声称的设备编号（后续稿件可改）                |
+| `occurred_at` | **必须带时区**的 ISO-8601 时间（`Z` 或 `±HH:MM`），归一到 UTC |
+| `metric`      | 非空字符串，指标名（如 `vibration_rms`）                      |
+| `amount`      | **有限十进制文本**（`Decimal` 解析，拒绝 NaN/Infinity）       |
+| `withdrawn`   | 布尔；`true` 表示该稿件撤回此观测                             |
+
+缺字段、多字段、类型不符、朴素（无时区）时间、非有限十进制都按协议错误
+拒绝（退出码 2）。`amount` 全程以 `Decimal` 处理、以文本落库，求和绝不
+经过二进制浮点（因此 `0.1 + 0.2` 精确得到 `0.3`，而不是
+`0.30000000000000004`）。`occurred_at` 归一到 UTC 后再确定日期，
+`2026-11-12T00:30:00+08:00` 的 UTC 日期是 `2026-11-11`。
+
+### 9.2 稿件不可变、选版与篡改红线
+
+* **稿件身份** = `(origin, reading_key, edition)`；事实仓
+  `reading_editions` 只追加、永不改写、永不删除，每条稿件原文
+  （含到达批次、内容哈希）都可经 `audit` 复查。
+* **观测身份** = `(origin, reading_key)`。新稿件号（更大 `edition`）可以
+  改读数、发生时间、设备、指标，也可以撤回；选版永远取**截止范围内的
+  最大 edition**，因此迟来的旧稿件无法盖过新版。
+* 同一稿件身份重投且内容逐字一致 → 幂等无操作；**同稿件换了任何内容
+  字段** → `EditionConflict`（退出码 3）整批拒收，事实仓批次不前进。
+* 一次投递是不可分割的确认批次：稿件对照与写入、批次登记在同一条 SQLite
+  事务内落定，任何矛盾整体回滚。
+
+### 9.3 统计口径：两个坐标同时冻结
+
+一次统计明确固定两个口径坐标，落在 `stats_runs` 一行：
+
+1. **截止批次 `cutoff_batch_id`**：读数只取随批次号 `<= 截止批次` 收到的
+   稿件。构建开始即把口径登记为 `building` 并提交，之后即使新批次到达也
+   不混入——已声明截止批次的统计不可能掺入后来才收到的内容。
+2. **设备分组版本 `grouping_version`**：设备归属只查归并层**该版本快照**
+   的成员（`version_entities`），绝不套用“今天”的成员。
+
+在该范围内：每条观测选最大 edition → 最新稿 `withdrawn=true` 的排除
+（仍留在明细与撤回清单）→ 其余按选中稿件声称的 `device` 在该分组版本中
+找实体。设备不在那一版成员中时进入**可查询的待归属清单**
+（`outcome=unassigned`），不静默丢弃、不强行归类。产出按
+**实体 × UTC 日期 × 指标** 划分的条数、精确和、最小值、最大值
+（`stats_cells`）。
+
+### 9.4 下钻、归属依据与口径切换
+
+* `drill` 从一个格子下钻到构成它的每条读数：读数身份 `(origin,
+  reading_key)`、采用的 `chosen_edition`、稿件载荷、到达批次，以及归属
+  依据（分组版本、设备→实体、判定原因）。
+* 从旧分组切到新分组：**合并**把若干格子合到同一实体，**拆分**则把各条
+  读数重新分配到不同实体；跨天/跨设备更正后，原格子的计数与极值随之
+  修正，撤回项从格子移除但保留在撤回清单。
+* 每个口径独立持久化，可指定任意历史口径查看；重复生成同一对
+  `(cutoff_batch, grouping_version)` 直接复用已发布结果（`status=reused`）。
+
+### 9.5 原子发布、构建中可读与崩溃恢复
+
+* 明细（`stats_observations` / `stats_attribution`）与格子
+  （`stats_cells`）在一条事务内写就，最后才把 `stats_runs` 从
+  `building` 翻成 `published`。在线查询只认 `published`，因此构建较慢时
+  分析人员仍读到上一份完整日报，**不会先清空在线结果**。
+* 故障注入点 `after_detail_before_publish`（`os._exit(42)`）位于明细已写、
+  尚未发布处：未提交事务整体回滚，只留下阶段一已提交的 `building` 残档。
+  重开后旧日报照常可读，`building` 口径不对外可见（明确报错而非半空
+  结果），用同一对口径重建即安全清理残档并发布。
+* 资料送达与统计生成可交错：`build --gate-dir` 提供基于文件的跨进程同步
+  门，构建进程在门点等待时，另一进程可继续 `ingest` 新批次；放行后选版
+  查询仍带 `ingest_batch_id <= cutoff`，截止范围保持一致。构建另有
+  `flock` 跨进程互斥锁，避免并发构建互相踩踏。
+
+### 9.6 SQLite 表（第三个独立数据库，WAL + synchronous=FULL）
+
+| 表                     | 用途                                                  |
+|------------------------|-------------------------------------------------------|
+| `meta`                 | `last_batch_id`、`schema_version`                     |
+| `ingest_batches`       | 每个被确认的读数投递批次（截止批次的锚点）            |
+| `reading_editions`     | 不可变逐稿件事实仓（含到达批次、UTC 日期、内容哈希）  |
+| `stats_runs`           | 口径登记：building / published 与各项计数、输入哈希   |
+| `stats_observations`   | 口径下每条观测选中的最新版（下钻事实）                |
+| `stats_attribution`    | 每条选中观测的归属依据 / 待归属 / 撤回原因            |
+| `stats_cells`          | 按日指标投影：实体 × UTC 日期 × 指标的精确聚合        |
+
+### 9.7 运行方式
+
+```bash
+cd /workspace/cdc_loader
+
+# (0) 准备样例：最小上游快照 + 归并批次（合并/拆开）+ 五个读数批次
+python3 -I examples/generate_reading_sample.py /tmp/reading_sample
+
+# (1) 上游快照 + 归并层版本（版本1 单设备 / 版本2 合并 DA-DB / 版本3 拆开）
+python3 -I run_cli.py import-snapshot --db /tmp/rd/loader.db \
+    --manifest /tmp/reading_sample/loader/manifest.json \
+    --shards /tmp/reading_sample/loader/shard_0.jsonl
+python3 -I run_entity.py refresh --ledger-db /tmp/rd/ledger.db --loader-db /tmp/rd/loader.db
+python3 -I run_entity.py ingest  --ledger-db /tmp/rd/ledger.db --batch /tmp/reading_sample/entity/g1_merge.jsonl
+python3 -I run_entity.py ingest  --ledger-db /tmp/rd/ledger.db --batch /tmp/reading_sample/entity/g2_split.jsonl
+
+RDB=/tmp/rd/reading.db; LDB=/tmp/rd/ledger.db
+
+# (2) 接收读数（可多文件合成一批，可多次调用，断点幂等）
+python3 -I run_reading.py ingest --reading-db "$RDB" \
+    --batch /tmp/reading_sample/reading/b1_base.jsonl /tmp/reading_sample/reading/b2_unknown.jsonl
+
+# (3) 按固定口径生成并发布统计（截止批次 + 分组版本）
+python3 -I run_reading.py build --reading-db "$RDB" --ledger-db "$LDB" \
+    --cutoff-batch 1 --grouping-version 2     # 合并口径
+python3 -I run_reading.py build --reading-db "$RDB" --ledger-db "$LDB" \
+    --cutoff-batch 1 --grouping-version 3     # 拆分口径（同一截止、不同归属）
+
+# (4) 按格子查询 / 从格子下钻 / 待归属清单 / 稿件审计 / 口径登记
+python3 -I run_reading.py cells      --reading-db "$RDB" --cutoff-batch 1 --grouping-version 2
+python3 -I run_reading.py drill      --reading-db "$RDB" --cutoff-batch 1 --grouping-version 2 \
+    --entity E-DA --date 2026-11-11 --metric vibration_rms
+python3 -I run_reading.py unassigned --reading-db "$RDB" --cutoff-batch 2 --grouping-version 2
+python3 -I run_reading.py audit      --reading-db "$RDB" --origin plant-a --reading-key r1
+python3 -I run_reading.py runs       --reading-db "$RDB"
+python3 -I run_reading.py status     --reading-db "$RDB"
+
+# (5) 独立离线核算器：逐格 + 逐条下钻 + 逐条待归属全量对照
+python3 -I run_reading.py verify --reading-db "$RDB" --ledger-db "$LDB"
+```
+
+### 9.8 独立离线核算器
+
+`reading/reconcile.py` 不 import 读数层的任何其它模块，只用标准库独立地：
+按口径截止批次重新扫描 `reading_editions` 自行选版 → 只读打开归并层台账
+取该分组版本成员做归属 → 用 `Decimal` 独立聚合 → 与 `stats_cells`
+**逐格**、与 `stats_observations` **逐条下钻明细**、与
+`stats_attribution` 的**每一条待归属/撤回记录**比对，并复核五项计数。
+不是只核对总行数；任何不一致逐条列出并以退出码 6 结束。`building`
+残档不参与对照，但会在报告的 `building_run_ids` 中单独列出。
+
+### 9.9 失败后如何处置
+
+| 失败情形                     | 现象/退出码                | 处置                                                     |
+|------------------------------|----------------------------|----------------------------------------------------------|
+| 读数行字段/时间/十进制非法   | `ReadingProtocolError`，2  | 修正批次文件后整批重投；事实仓无残留                     |
+| 同稿件身份内容被改写         | `EditionConflict`，3       | 数据红线，人工核对来源；拒收且批次不前进                 |
+| 截止批次/分组版本不存在      | `CaliberNotFound`，7       | 先确认读数批次与归并层版本，再用合法坐标构建             |
+| 明细已写未发布时崩溃         | 退出码 42                  | 重开后旧日报可读；同口径重建清理 building 残档并发布     |
+| 普通进程退出                 | —                          | 全部状态在 SQLite，重开同一 `--reading-db` 继续          |
+
+### 9.10 读数层演示与测试
+
+```bash
+python3 -I examples/demo_reading.py               # 32 项端到端断言（含真实崩溃与进程间同步）
+python3 -m unittest discover -s tests -v          # 装载器 + 归并层 + 读数层全部单元测试
+```
+
+演示覆盖：设备链归并后又拆开，两种归属口径下完整明细与指标对比；把当前
+最小读数改到次日另一设备、再撤回当前最大值后原格子计数与极值的修正；
+未知设备在新分组版本中仍进待归属清单的变化；带时差的午夜读数归 UTC
+日期与十进制 `0.1 + 0.2 = 0.3` 精确求和；同稿篡改拒收、迟来旧稿不盖
+新版、重传幂等；用进程间同步门在构建期间再收新稿件以证明截止范围一致；
+明细已写未启用阶段直接结束进程后旧日报可读、新口径安全重建；最后由独立
+离线核算器对所有格子、全部下钻明细与待归属记录做全量对照。
